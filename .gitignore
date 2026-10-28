@@ -1,0 +1,24 @@
+# Local build and release output
+*.exe
+*.pdb
+*.zip
+dist/
+bin/
+obj/
+tests/*.png
+tests/*.error.txt
+
+# Local publishing tools and development conversation records
+.publish/
+docs/superpowers/
+
+# Editor files, logs and credentials
+.vs/
+.vscode/
+*.user
+*.suo
+*.log
+.env
+.env.*
+Thumbs.db
+Desktop.ini
