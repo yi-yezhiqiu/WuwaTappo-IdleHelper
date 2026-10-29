@@ -70,6 +70,8 @@ namespace TappoIdle
             return GetForegroundWindow() == window;
         }
 
+        public static bool ForegroundIsTransitioning { get { return GetForegroundWindow() == IntPtr.Zero; } }
+
         public static bool IsPetRunning()
         {
             Process[] pets = Process.GetProcessesByName("WuwaTappo");
