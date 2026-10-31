@@ -42,6 +42,13 @@ internal static class ChestEngineTests
         Run("Reset clears faults counts pending and time", ResetClearsSession);
         Run("Reset cancels an outstanding decision", ResetCancelsDecision);
         Run("Elapsed checks handle extreme timestamps", ExtremeTimestampBoundaries);
+        Run("Known insufficient clicks wait without attempts or faults", InsufficientClickBalanceWaits);
+        Run("Reaching 1000 clicks preserves the stable ready window", ThresholdPreservesStableReady);
+        Run("Low balance cannot block pending cooling confirmation", LowBalanceAllowsPendingConfirmation);
+        Run("Low balance preserves cooling and readiness transitions", LowBalancePreservesCoolingState);
+        Run("Waiting for clicks does not consume the retry budget", LowBalancePreservesRetryBudget);
+        Run("Unknown available clicks retain the legacy policy", UnknownBalanceKeepsLegacyPolicy);
+        Run("Fresh low balance cancels an undispatched decision without failure", FreshLowBalanceCancelsDecision);
         Console.WriteLine("RESULT: {0} passed, {1} failed", passed, failed);
         return failed == 0 ? 0 : 1;
     }
@@ -80,6 +87,12 @@ internal static class ChestEngineTests
     private static ChestSnapshot CoolingLower()
     {
         return Snapshot(ChestSlotState.Cooling, 1799, ChestSlotState.Ready, 0);
+    }
+
+    private static ChestSnapshot WithClicks(ChestSnapshot snapshot, long? availableClicks)
+    {
+        snapshot.AvailableClicks = availableClicks;
+        return snapshot;
     }
 
     private static ChestEngine ClickedLower()
@@ -493,5 +506,107 @@ internal static class ChestEngineTests
         engine.RecordClick(long.MaxValue, 0, true);
         Equal(-1, engine.Observe(long.MinValue, ReadyLower()), "overflow cannot turn backwards time into retry");
         Equal(1, engine.Attempts, "backward time no extra attempts");
+    }
+
+    private static void InsufficientClickBalanceWaits()
+    {
+        foreach (long clicks in new long[] { -1, 0, 999 })
+        {
+            var engine = new ChestEngine();
+            engine.Observe(0, WithClicks(ReadyBoth(), clicks));
+            Equal(-1, engine.Observe(2000, WithClicks(ReadyBoth(), clicks)), "stable ready still requires 1000 clicks");
+            Equal(-1, engine.Observe(12000, WithClicks(ReadyBoth(), clicks)), "first retry interval remains a wait");
+            Equal(-1, engine.Observe(22000, WithClicks(ReadyBoth(), clicks)), "second retry interval remains a wait");
+            Equal(0, engine.Attempts, "waiting never counts an attempt");
+            Equal(0, engine.Confirmed, "waiting never counts success");
+            Equal(false, engine.Faulted, "waiting never consumes failure budget");
+            Equal(-1, engine.PendingSlot, "waiting never creates pending click");
+            if (engine.Message.IndexOf("次数", StringComparison.Ordinal) < 0 ||
+                engine.Message.IndexOf("1000", StringComparison.Ordinal) < 0)
+                throw new Exception("Missing status explaining the 1000-click requirement");
+        }
+    }
+
+    private static void ThresholdPreservesStableReady()
+    {
+        var engine = new ChestEngine();
+        engine.Observe(0, WithClicks(ReadyBoth(), 999));
+        Equal(-1, engine.Observe(2000, WithClicks(ReadyBoth(), 999)), "stable but one click short");
+        Equal(0, engine.Observe(2001, WithClicks(ReadyBoth(), 1000)), "already stable button allowed when threshold reached");
+        engine.RecordClick(2001, 0, true);
+        Equal(1, engine.Attempts, "only the actual threshold-qualified attempt counts");
+        Equal(-1, engine.Observe(2100, WithClicks(ReadyBoth(), 1000)), "one box at a time even if both ready");
+        Equal(0, engine.PendingSlot, "first box remains pending");
+    }
+
+    private static void LowBalanceAllowsPendingConfirmation()
+    {
+        var engine = new ChestEngine();
+        engine.Observe(0, WithClicks(ReadyBoth(), 1000));
+        Equal(0, engine.Observe(2000, WithClicks(ReadyBoth(), 1000)), "sufficient balance permits lower click");
+        engine.RecordClick(2000, 0, true);
+        Equal(-1, engine.Observe(4000, WithClicks(CoolingLower(), 0)), "lower pending cannot click upper");
+        Equal(0, engine.PendingSlot, "first cooling observation retained with depleted balance");
+        engine.Observe(4100, WithClicks(CoolingLower(), 0));
+        Equal(1, engine.Confirmed, "second cooling confirms despite spent balance");
+        Equal(-1, engine.PendingSlot, "successful pending released");
+        Equal(-1, engine.Observe(6100, WithClicks(CoolingLower(), 0)), "upper waits for its own 1000-click funding");
+        Equal(1, engine.Attempts, "depleted balance causes no second attempt");
+        Equal(1, engine.Observe(6101, WithClicks(CoolingLower(), 1000)), "upper allowed after replenishment");
+    }
+
+    private static void LowBalancePreservesCoolingState()
+    {
+        var engine = new ChestEngine();
+        var cooling = Snapshot(ChestSlotState.Cooling, 60, ChestSlotState.Unknown, 0);
+        engine.Observe(0, WithClicks(cooling, 999));
+        Equal(-1, engine.Observe(60000, WithClicks(cooling, 999)), "cooling never becomes a blind click");
+        Equal(-1, engine.Observe(62000, WithClicks(ReadyLower(), 999)), "new ready window starts normally");
+        Equal(-1, engine.Observe(63999, WithClicks(ReadyLower(), 1000)), "funding does not skip two-second readiness");
+        Equal(-1, engine.Observe(64000, WithClicks(ReadyLower(), 999)), "stable readiness still respects available clicks");
+        Equal(0, engine.Observe(64001, WithClicks(ReadyLower(), 1000)), "cooling and ready transitions preserved while waiting");
+    }
+
+    private static void LowBalancePreservesRetryBudget()
+    {
+        var engine = new ChestEngine();
+        engine.Observe(0, WithClicks(ReadyBoth(), 1000));
+        Equal(0, engine.Observe(2000, WithClicks(ReadyBoth(), 1000)), "first funded attempt");
+        engine.RecordClick(2000, 0, false);
+        Equal(0, engine.Observe(12000, WithClicks(ReadyBoth(), 1000)), "second funded attempt");
+        engine.RecordClick(12000, 0, false);
+        Equal(-1, engine.Observe(22000, WithClicks(ReadyBoth(), 999)), "low balance prevents third attempt");
+        Equal(-1, engine.Observe(100000, WithClicks(ReadyBoth(), 999)), "waiting does not retry");
+        Equal(2, engine.Attempts, "only prior attempts retained");
+        Equal(false, engine.Faulted, "two failures plus long waiting never fault");
+        Equal(0, engine.Observe(100001, WithClicks(ReadyBoth(), 1000)), "funding permits actual third attempt");
+        engine.RecordClick(100001, 0, false);
+        Equal(3, engine.Attempts, "third actual attempt counts");
+        Equal(true, engine.Faulted, "waiting did not erase actual prior failures either");
+    }
+
+    private static void UnknownBalanceKeepsLegacyPolicy()
+    {
+        var engine = new ChestEngine();
+        engine.Observe(0, WithClicks(ReadyLower(), 999));
+        Equal(-1, engine.Observe(2000, WithClicks(ReadyLower(), 999)), "known balance shortage blocks");
+        Equal(0, engine.Observe(2001, ReadyLower()), "default unknown balance retains existing ready policy");
+        engine.RecordClick(2001, 0, true);
+        engine.Observe(4001, CoolingLower());
+        engine.Observe(4101, CoolingLower());
+        Equal(1, engine.Confirmed, "unknown balance preserves confirmation behavior");
+    }
+
+    private static void FreshLowBalanceCancelsDecision()
+    {
+        var engine = new ChestEngine();
+        engine.Observe(0, WithClicks(ReadyLower(), 1000));
+        Equal(0, engine.Observe(2000, WithClicks(ReadyLower(), 1000)), "initial funded decision");
+        Equal(-1, engine.Observe(2001, WithClicks(ReadyLower(), 999)), "fresh low balance cancels pending dispatch decision");
+        engine.RecordClick(2001, 0, false);
+        Equal(0, engine.Attempts, "canceled unfunded decision is not an attempted click");
+        Equal(false, engine.Faulted, "canceled unfunded decision is not a failure");
+        Equal(-1, engine.PendingSlot, "unfunded decision never dispatched");
+        Equal(0, engine.Observe(2002, WithClicks(ReadyLower(), 1000)), "replenishment allows a fresh decision");
     }
 }

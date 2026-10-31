@@ -14,6 +14,7 @@ namespace TappoIdle
     {
         public ChestSlot Lower = new ChestSlot();
         public ChestSlot Upper = new ChestSlot();
+        public long? AvailableClicks;
     }
 
     public sealed class ChestEngine
@@ -112,6 +113,16 @@ namespace TappoIdle
                     }
                     return -1;
                 }
+            }
+
+            // Funding gates only a new dispatch. Keep observing ready/cooling
+            // above so a spent balance cannot suppress an in-flight success.
+            if (snapshot != null && snapshot.AvailableClicks.HasValue &&
+                snapshot.AvailableClicks.Value < 1000)
+            {
+                decisionSlot = -1;
+                Message += "；可用次数 " + snapshot.AvailableClicks.Value + "，等待补足1000次后领取";
+                return -1;
             }
 
             if (decisionSlot != -1) return -1;

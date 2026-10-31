@@ -202,6 +202,27 @@ internal static class UiIntegrationTests
                 Call(form, "PhysicalInput");
                 Check(!Field<bool>(form, "sessionActive") && service.Stops == 1, "physical input always stops during an expected focus transition");
             }
+            using (MainForm form = New(true, false))
+            {
+                Field<NumericUpDown>(form, "target").Value = 10;
+                Field<NumericUpDown>(form, "interval").Value = 50;
+                Start(form);
+                Expire(form);
+                ChestService service = Current(form);
+                service.InFlight = true;
+                int sends = NativeInput.Sends;
+                NativeInput.Foreground = false;
+                Call(form, "TickRun");
+                Check(Field<bool>(form, "sessionActive") && NativeInput.Sends == sends, "activation chain waits without input even before target foreground settles");
+                NativeInput.Foreground = true;
+                Thread.Sleep(60);
+                Field<LoopGuard>(form, "loopGuard").Reset(Now(form));
+                Call(form, "TickRun");
+                Check(Field<bool>(form, "sessionActive") && NativeInput.Sends == sends, "entire in-flight marker pauses keys even when helper is foreground");
+                service.IsActionTimedOut = true;
+                Call(form, "TickRun");
+                Check(!Field<bool>(form, "sessionActive") && service.Stops == 1, "activation timeout cancels without any further key input");
+            }
             MainForm disposed = New(true, true);
             PureRun(disposed);
             ChestService last = Current(disposed);

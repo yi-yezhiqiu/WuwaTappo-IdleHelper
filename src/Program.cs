@@ -264,8 +264,7 @@ namespace TappoIdle
             timer.Tick += delegate { TickRun(); };
             Deactivate += delegate
             {
-                bool expected = chestService != null && chestService.IsFocusTransitionInProgress &&
-                    (chestService.IsExpectedFocusTransition || NativeInput.ForegroundIsTransitioning);
+                bool expected = chestService != null && chestService.IsFocusTransitionInProgress;
                 if (!NativeInput.IsForeground(Handle) && !expected) StopRun("窗口已离开前台");
             };
             KeyDown += delegate(object sender, KeyEventArgs e)
@@ -366,8 +365,7 @@ namespace TappoIdle
                         StopRun("标准按钮调用超过时限，自动开箱保护已停止");
                         return;
                     }
-                    if (chestService != null && chestService.IsFocusTransitionInProgress &&
-                        (foreground || chestService.IsExpectedFocusTransition || NativeInput.ForegroundIsTransitioning))
+                    if (chestService != null && chestService.IsFocusTransitionInProgress)
                     {
                         RenderState();
                         return;

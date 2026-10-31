@@ -36,6 +36,7 @@ namespace TappoIdle
         private IntPtr focusVisual;
         private string failureReason;
         public event Action<ChestStatus> StatusChanged;
+        public event Action<string> Diagnostic;
 
         public ChestService() { heartbeat = new HeartbeatLease(delegate { return clock.ElapsedMilliseconds; }); }
 
@@ -66,10 +67,29 @@ namespace TappoIdle
 
         private bool Allowed()
         {
-            if (disposed || cancellation.IsCancellationRequested || !heartbeat.IsAlive()) return false;
+            if (disposed || cancellation.IsCancellationRequested) return false;
+            if (!heartbeat.IsAlive())
+            {
+                failureReason = "界面心跳超过保护时限，自动开箱已停止，请手动重新开始";
+                Diagnose("heartbeat expired");
+                return false;
+            }
             if (NativeInput.IsForeground(helperWindow) || IsExpectedFocusTransition) return true;
+            failureReason = "窗口焦点转移到未授权窗口，自动开箱已停止，请手动重新开始";
+            Diagnose("unexpected foreground");
             heartbeat.Revoke();
             return false;
+        }
+
+        private void Diagnose(string message)
+        {
+            Action<string> handler = Diagnostic;
+            if (handler == null) return;
+            IntPtr foreground = GetForegroundWindow();
+            uint pid; GetWindowThreadProcessId(foreground, out pid);
+            string details = String.Format("{0}ms {1}; fg={2} pid={3} class={4} root={5} owner={6} marker={7} deadline={8}",
+                clock.ElapsedMilliseconds, message, foreground, pid, WindowClass(foreground), GetAncestor(foreground, 2), GetAncestor(foreground, 3), Thread.VolatileRead(ref expectedFocus), Interlocked.Read(ref focusDeadline));
+            try { handler(details); } catch (Exception) { }
         }
 
         public bool IsExpectedFocusTransition
@@ -122,19 +142,25 @@ namespace TappoIdle
                     {
                         clickError = null;
                         bool posted = false;
+                        bool waitingForClicks = false;
                         try
                         {
                             // Re-read just before acting: stale screen coordinates never trigger a click.
                             Probe fresh = Read();
                             if (!Allowed()) return;
-                            if (fresh.Visual == probe.Visual && fresh.Input == probe.Input &&
+                            if (fresh.Snapshot.AvailableClicks.HasValue && fresh.Snapshot.AvailableClicks.Value < 1000)
+                            {
+                                policy.Observe(clock.ElapsedMilliseconds, fresh.Snapshot);
+                                waitingForClicks = true;
+                            }
+                            else if (fresh.Visual == probe.Visual && fresh.Input == probe.Input &&
                                 fresh.ProcessId == probe.ProcessId && fresh.Ready(slot) &&
                                 SamePosition(probe.Buttons[slot], fresh.Buttons[slot]))
                                 posted = Click(fresh, slot);
                         }
                         catch (Exception) { posted = false; }
                         if (!Allowed()) return;
-                        policy.RecordClick(clock.ElapsedMilliseconds, slot, posted);
+                        if (!waitingForClicks) policy.RecordClick(clock.ElapsedMilliseconds, slot, posted);
                     }
                     Publish(policy, probe.Description + (clickError == null ? "" : "；" + clickError));
                     if (policy.Faulted) return;
@@ -258,6 +284,7 @@ namespace TappoIdle
             AutomationElement root = AutomationElement.FromHandle(result.Visual);
             List<Rect> docks = new List<Rect>();
             List<UiPart> rewards = new List<UiPart>();
+            List<UiPart> numbers = new List<UiPart>();
             CacheRequest cache = new CacheRequest();
             {
                 cache.Add(AutomationElement.ClassNameProperty);
@@ -277,6 +304,9 @@ namespace TappoIdle
                         if (CssClass(cls, "pet-dock-content")) docks.Add(rect);
                         if (CssClass(cls, "reward-countdown") || CssClass(cls, "reward-btn"))
                             rewards.Add(new UiPart { ClassName = cls, Name = element.Cached.Name, Bounds = rect, Element = element });
+                        long displayed;
+                        if (TryAvailableClicks(element.Cached.Name, out displayed))
+                            numbers.Add(new UiPart { Name = element.Cached.Name, Bounds = rect });
                     }
                 }
             }
@@ -286,6 +316,17 @@ namespace TappoIdle
                 return result;
             }
             Rect dock = docks[0];
+            int balances = 0;
+            foreach (UiPart number in numbers)
+            {
+                Rect bounds = number.Bounds;
+                double centerX = bounds.X + bounds.Width / 2;
+                double centerY = bounds.Y + bounds.Height / 2;
+                if (centerX < dock.Left || centerX > dock.Right || centerY < dock.Bottom - dock.Height * 0.20 || centerY > dock.Bottom + dock.Height * 0.05) continue;
+                long value;
+                if (TryAvailableClicks(number.Name, out value)) { result.Snapshot.AvailableClicks = value; balances++; }
+            }
+            if (balances != 1) result.Snapshot.AvailableClicks = null;
             int[] seen = new int[2];
             foreach (UiPart part in rewards)
             {
@@ -320,6 +361,7 @@ namespace TappoIdle
             if (seen[0] != 1) result.Snapshot.Lower.State = ChestSlotState.Unknown;
             if (seen[1] != 1) result.Snapshot.Upper.State = ChestSlotState.Unknown;
             result.Description = "下箱 " + Describe(result.Snapshot.Lower) + " · 上箱 " + Describe(result.Snapshot.Upper);
+            if (result.Snapshot.AvailableClicks.HasValue && result.Snapshot.AvailableClicks.Value < 1000) result.Description += "；次数不足 1000，等待补足";
             if (seen[0] + seen[1] == 0) result.Description += "；请在桌宠中启用始终显示宝箱倒计时";
             return result;
         }
@@ -347,6 +389,14 @@ namespace TappoIdle
             seconds = minutes * 60 + remainder;
             return seconds <= 1800;
         }
+        private static bool TryAvailableClicks(string text, out long value)
+        {
+            value = 0;
+            string number = (text ?? "").Trim().TrimEnd('+');
+            if (number.Length == 0 || number.Length > 18) return false;
+            foreach (char c in number) if ((c < '0' || c > '9') && c != ',') return false;
+            return Int64.TryParse(number, NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out value) && value >= 0;
+        }
         private static string Describe(ChestSlot slot)
         {
             if (slot.State == ChestSlotState.Ready) return "可开启";
@@ -368,25 +418,42 @@ namespace TappoIdle
                 focusVisual = probe.Visual;
                 Interlocked.Exchange(ref focusDeadline, clock.ElapsedMilliseconds + 2000);
                 Interlocked.Exchange(ref expectedFocus, 1);
+                Diagnose("invoke start");
                 try
                 {
                     ((InvokePattern)pattern).Invoke();
-                    // Win32 can briefly report no foreground during an activation transition.
-                    // Wait without acting until it identifies our helper or this exact pet.
-                    for (int i = 0; GetForegroundWindow() == IntPtr.Zero && i < 10 && IsFocusTransitionInProgress; i++)
-                        if (cancellation.Token.WaitHandle.WaitOne(10)) return false;
-                    if (!Allowed()) return false;
+                    Diagnose("invoke returned");
+                    // Invoke returns before Windows finishes activation. The transition may
+                    // pass through the previously active application. Wait without sending
+                    // any input; only a stable helper/pet foreground authorizes restoration.
+                    if (!WaitForActionForeground(false))
+                    {
+                        failureReason = "领取后的窗口激活未在保护时限内稳定，已停止";
+                        heartbeat.Revoke();
+                        return false;
+                    }
                     // A normal Invoke may activate the pet. Restore only our own original
                     // foreground, only while this exact action still has permission.
                     if (!NativeInput.IsForeground(helperWindow))
                     {
-                        if (!IsExpectedFocusTransition || !Allowed() || !SetForegroundWindow(helperWindow))
+                        IntPtr beforeRestore = GetForegroundWindow();
+                        if ((beforeRestore != helperWindow && !PetOwnsForeground(beforeRestore)) || !Allowed())
                         {
-                            clickError = "领取已触发，但助手前台未能恢复，请手动重新开始";
+                            clickError = "领取已触发，但恢复前的窗口归属发生变化，已停止";
                             failureReason = clickError;
                             heartbeat.Revoke();
                             return false;
                         }
+                        bool requested = SetForegroundWindow(helperWindow);
+                        Diagnose("foreground restore request returned " + requested);
+                        // Cross-thread activation is asynchronous. Its eventual observed
+                        // foreground is the result, not this request's immediate return value.
+                    }
+                    if (!WaitForActionForeground(true))
+                    {
+                        failureReason = "领取已触发，但助手前台未能稳定恢复，已停止";
+                        heartbeat.Revoke();
+                        return false;
                     }
                     return Allowed() && NativeInput.IsForeground(helperWindow);
                 }
@@ -407,6 +474,28 @@ namespace TappoIdle
             // Always release a down already enqueued, including during cancellation.
             bool released = Post(probe.Input, 0x0202, IntPtr.Zero, coordinates);
             return released && !cancellation.IsCancellationRequested;
+        }
+
+        private bool WaitForActionForeground(bool helperOnly)
+        {
+            long began = clock.ElapsedMilliseconds;
+            long stableSince = -1;
+            IntPtr last = IntPtr.Zero;
+            while (IsFocusTransitionInProgress)
+            {
+                long now = clock.ElapsedMilliseconds;
+                IntPtr foreground = GetForegroundWindow();
+                bool trusted = foreground == helperWindow || (!helperOnly && PetOwnsForeground(foreground));
+                if (trusted)
+                {
+                    if (foreground != last || stableSince < 0) stableSince = now;
+                    if (now - began >= (helperOnly ? 50 : 250) && now - stableSince >= 50) return true;
+                }
+                else stableSince = -1;
+                last = foreground;
+                if (cancellation.Token.WaitHandle.WaitOne(10)) return false;
+            }
+            return false;
         }
 
         private bool Post(IntPtr window, uint message, IntPtr parameter, IntPtr coordinates)

@@ -40,7 +40,8 @@ namespace TappoIdle
         public static readonly List<ChestService> Created = new List<ChestService>();
         public int Starts, Stops, Disposes, Heartbeats;
         public bool IsExpectedFocusTransition { get; set; }
-        public bool IsFocusTransitionInProgress { get { return IsExpectedFocusTransition; } }
+        public bool InFlight;
+        public bool IsFocusTransitionInProgress { get { return IsExpectedFocusTransition || InFlight; } }
         public bool IsActionTimedOut { get; set; }
         public event Action<ChestStatus> StatusChanged;
 
